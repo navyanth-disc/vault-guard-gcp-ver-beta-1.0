@@ -16,11 +16,12 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form
 from fastapi.responses import HTMLResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from google.genai import types
 
 from ai.guardrail import evaluate_guardrail
 from rag.sanitizer import sanitize_pii
 from ai.tools.loan_calculator import calculate_loan_emi
-from ai.tools.underwriting_rules import calculate_collateral_ltv
+from ai.tools.underwriting_rules import calculate_collateral_ltv, calculate_foir_eligibility
 from rag.retriever import RegulatoryRetriever
 from rag.loader import extract_text_from_bytes
 
@@ -313,47 +314,52 @@ def chat(req: ChatRequest):
     safe_query, pii_count, pii_method = sanitize_pii(raw_query)
     METRICS["pii_masked_count"] += pii_count
     
-    # 4. Deterministic Financial Math Tools
-    if "emi" in safe_query.lower() or "calculate" in safe_query.lower() or "installment" in safe_query.lower():
-        tool_res = calculate_loan_emi(
-            principal=5000000.0,
-            annual_rate_pct=ACTIVE_POLICY["interest_rate_default"],
-            tenure_years=ACTIVE_POLICY["tenure_default_years"]
+    # 4. Agentic Tool Execution & RAG (Gemini Function Calling)
+    # The LLM is the "judgement brain" while the Python code does the math.
+    def search_rbi_guidelines(query: str) -> str:
+        """Searches official Reserve Bank of India (RBI) Regulatory Corpus for banking guidelines, compliance rules, and statutory directives."""
+        hits, was_cache_hit = retriever.retrieve(query, top_k=1)
+        if hits:
+            # We record cache_hit globally for telemetry
+            global _last_cache_hit
+            _last_cache_hit = was_cache_hit
+            return f"Source: {hits[0]['source']}\nText: {hits[0]['text'][:2000]}"
+        return "No regulatory evidence found. Abstain from guessing."
+
+    global _last_cache_hit
+    _last_cache_hit = False
+
+    try:
+        client = get_gemini_client()
+        chat = client.chats.create(
+            model='gemini-2.5-flash',
+            config=types.GenerateContentConfig(
+                tools=[calculate_loan_emi, calculate_collateral_ltv, calculate_foir_eligibility, search_rbi_guidelines],
+                temperature=0.0,
+                system_instruction=(
+                    "You are VaultGuard, an Enterprise Credit Underwriting Copilot.\n"
+                    "Instructions:\n"
+                    "1. If the user asks for calculations (EMI, LTV max loan, FOIR capacity), you MUST use the appropriate calculator tool (e.g. calculate_loan_emi, calculate_collateral_ltv, calculate_foir_eligibility). Pass exactly the numbers they requested (convert lakhs to actual numbers, e.g., 50 lakhs = 5000000).\n"
+                    "2. If the user asks about RBI rules or banking policies, you MUST use the search_rbi_guidelines tool.\n"
+                    "3. If search_rbi_guidelines returns 'No regulatory evidence found.', you MUST reply EXACTLY with: 'I cannot find sufficient evidence in the official RBI Regulatory Corpus to substantiate an answer for this query. As an enterprise banking copilot, I abstain from guessing policy rules.'\n"
+                    "4. After executing a tool, present the final answer clearly to the officer using Markdown.\n"
+                    "5. Do NOT guess or hallucinate."
+                )
+            )
         )
-        answer = (
-            f"**Verified Loan EMI Calculation:**\n"
-            f"• Principal Amount: ₹{tool_res['principal']:,.2f}\n"
-            f"• Interest Rate: {tool_res['annual_rate_pct']}% p.a.\n"
-            f"• Monthly EMI: **₹{tool_res['monthly_emi']:,.2f}**\n"
-            f"• Total Interest: ₹{tool_res['total_interest']:,.2f}\n"
-            f"• Tenure: {tool_res['tenure_years']} Years ({tool_res['tenure_months']} Months)"
-        )
-        lat_ms = round((time.perf_counter() - t0) * 1000, 2)
-        METRICS["latencies_ms"].append(lat_ms)
-        return {
-            "answer": answer,
-            "telemetry": {
-                "latency_ms": lat_ms,
-                "route_tier": "DETERMINISTIC_TOOL_CALCULATOR",
-                "cache_hit": False,
-                "pii_masked_count": pii_count,
-                "circuit_breaker": "CLOSED (HEALTHY)"
-            }
-        }
         
-    # 5. Regulatory RAG Retrieval with TTL Query Cache
-    hits, was_cache_hit = retriever.retrieve(safe_query, top_k=1)
-    if hits:
-        hit = hits[0]
-        answer = synthesize_regulatory_response(safe_query, hit)
-        route = "REGULATORY_RAG_CORPUS (CACHE_HIT)" if was_cache_hit else "REGULATORY_RAG_CORPUS (CACHE_MISS)"
-    else:
-        answer = (
-            "I cannot find sufficient evidence in the official RBI Regulatory Corpus to substantiate "
-            "an answer for this query. As an enterprise banking copilot, I abstain from guessing policy rules."
-        )
-        route = "ABSTENTION_ZERO_EVIDENCE"
+        response = chat.send_message(safe_query)
+        answer = response.text.strip()
         
+        route = "REGULATORY_RAG_CORPUS" if "search_rbi_guidelines" in str(chat.get_history()) else "AGENTIC_TOOL_EXECUTION"
+        if "I cannot find sufficient evidence" in answer:
+            route = "ABSTENTION_ZERO_EVIDENCE"
+            
+    except Exception as exc:
+        print(f"[Gemini 2.5 Flash] Tool invocation warning: {exc}")
+        answer = "I'm sorry, I encountered an error while processing your request via the mathematical or regulatory tools."
+        route = "ERROR"
+
     lat_ms = round((time.perf_counter() - t0) * 1000, 2)
     METRICS["latencies_ms"].append(lat_ms)
     return {
@@ -361,7 +367,7 @@ def chat(req: ChatRequest):
         "telemetry": {
             "latency_ms": lat_ms,
             "route_tier": route,
-            "cache_hit": was_cache_hit,
+            "cache_hit": _last_cache_hit,
             "pii_masked_count": pii_count,
             "circuit_breaker": "CLOSED (HEALTHY)"
         }
